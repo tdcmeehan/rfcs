@@ -13,7 +13,7 @@ an opportunity to suggest refinements before you start code.  For example, they 
 your work would otherwise collide with, or they may suggest implementation changes that make your feature more broadly
 usable.
 
-Smaller changes, including bug fixes and documentation improvements can be implemented and reviewed via the normal
+Smaller changes, including bug fixes and documentation improvements, can be implemented and reviewed via the normal
 GitHub pull request workflow on the main Presto repo.
 
 RFCs are more suitable for design proposals that are too large to discuss on a feature-request issue, like adding new
