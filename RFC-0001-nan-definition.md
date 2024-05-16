@@ -58,10 +58,10 @@ and E is the value of the <exponent>, then M * 10E is the apparent value of ANL.
 
 Some read the above as disallowing NaNs because floating point types are defined only as mantissa and exponent, and there are no special values defined like NaN, infinity, and -infinity.  I don't think it's clear one way or the other, and it looks like most databases do support NaN values.
 
-With regard to sorting, the ANSI spec says the following:							>											
-> f)  PVi is said to precede QVi if the value of the <comparison predicate> “PVi <comp op> QVi” is True for the applicable <comp op>.			
+With regard to sorting, the ANSI spec says the following:																
+> f)  PVi is said to precede QVi if the value of the &lt;comparison predicate> “PVi &lt;comp op> QVi” is True for the applicable &lt;comp op>.			
 >			 							
-> g)  If PVi and QVi are not the null value and the result of “PVi <comp op> QVi” is Unknown, then the relative ordering of PVi and QVi is implementation-dependent.
+> g)  If PVi and QVi are not the null value and the result of “PVi &lt;comp op> QVi” is Unknown, then the relative ordering of PVi and QVi is implementation-dependent.
 
 ### Current Presto behavior
 
