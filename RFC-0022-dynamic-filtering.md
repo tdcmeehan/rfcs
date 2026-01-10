@@ -374,7 +374,24 @@ These metrics enable tuning: consistently high missed opportunity rates suggest 
 - Coordinator still needs separate collection path for partition pruning, so not a complete simplification
 - Bloom filters would add significant per-shuffle overhead for high-cardinality joins
 
-**Why deferred**: This approach is architecturally cleaner for worker-to-worker distribution but requires deeper changes to the exchange layer. The main RFC's coordinator-push approach reuses existing HTTP infrastructure and allows incremental rollout. Exchange-based distribution could be a future optimization once the core feature is proven.
+**Multi-level join complexity**: Consider `A JOIN B JOIN C` where C is selective and its filter should propagate to help prune A:
+
+```
+Stage 1: C build, B probe → B' (filtered B)
+Stage 2: B' build, A probe
+```
+
+For worker-to-worker row filtering, exchange-based works: Stage 2 build workers create a filter from B' (which contains only values that survived the C filter), and ship it via exchange to A's probe workers. The filter propagation happens naturally through the data flow.
+
+However, for coordinator partition pruning on A, there's no simplification. The coordinator must still:
+1. Track the dependency: A's filter depends on Stage 2 build completing
+2. Wait for Stage 1 (B join C) to complete before Stage 2 build can produce a filter
+3. Collect and merge filters from all Stage 2 build workers
+4. Use the merged filter for A's split generation
+
+The exchange-based approach only eliminates coordinator involvement for the worker-to-worker path. The coordinator's role in partition pruning—including handling multi-level dependencies and merge logic—remains unchanged. This limits the simplification benefit.
+
+**Why deferred**: This approach is architecturally cleaner for worker-to-worker distribution but requires deeper changes to the exchange layer, and the coordinator path for partition pruning remains equally complex. The main RFC's coordinator-push approach reuses existing HTTP infrastructure and allows incremental rollout. Exchange-based distribution could be a future optimization once the core feature is proven.
 
 ### Alternative: Bloom Filters for High Cardinality
 
