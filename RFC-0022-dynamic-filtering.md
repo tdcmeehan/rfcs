@@ -336,6 +336,46 @@ These metrics enable tuning: consistently high missed opportunity rates suggest 
 
 ## Other Approaches Considered
 
+### Alternative: Exchange-Based Filter Distribution (Worker-to-Worker)
+
+**Approach**: Instead of the coordinator collecting filters and pushing them back to probe workers, have build workers ship filters directly via the exchange mechanism. The coordinator only gets involved for partition/file pruning via a side-channel notification.
+
+**Architecture**:
+
+1. **Automatic filter creation**: All hash join builds automatically create TupleDomains (and optionally bloom filters) when the build completes, regardless of optimizer hints. This is opportunistic—filters are created speculatively.
+
+2. **Exchange-based distribution**: When `HashBuild` completes, the filter is attached to the shuffle output as metadata. The exchange protocol carries the filter alongside the hash table data. On the receiving side, the exchange buffer stores the filter, making it available to `HashProbe` when it starts.
+
+3. **Coordinator side-channel**: For partition/file pruning, build workers notify the coordinator via `TaskStatus.outputsVersion` (same as the main RFC). The coordinator pulls and merges filters as needed for split generation. This path is unchanged from the main design.
+
+**Key insight for partitioned joins**: In a hash-partitioned join, build partition *i* contains rows where `hash(key) % N = i`, and probe partition *i* contains rows where `hash(key) % N = i`. Probe partition *i* only joins with build partition *i*. Therefore, probe worker *i* only needs the filter from build worker *i*—no merging required on the worker side. The exchange naturally delivers exactly the right filter to each probe partition.
+
+**Comparison with main RFC**:
+
+| Aspect | Main RFC (Coordinator Push) | Exchange-Based (Worker-to-Worker) |
+|--------|----------------------------|-----------------------------------|
+| Worker-side filter delivery | Coordinator merges, then pushes to probe workers via HTTP | Filter travels with exchange data |
+| Latency for row filtering | Round-trip through coordinator | Filter arrives with shuffled data |
+| Coordinator involvement | Collection + merge + distribution | Collection + merge (for splits only) |
+| Partitioned join merging | Coordinator merges all partitions | No merge needed—each probe gets its partition's filter |
+| Broadcast join handling | Any worker's filter is complete | Same, but filter replicated with build data |
+
+**Pros**:
+- Lower latency for worker-side filtering—filters arrive naturally with data flow
+- Simpler coordinator role—only handles partition/file pruning, not worker distribution
+- For partitioned joins, avoids unnecessary merging on probe workers
+- Filters are available earlier, potentially before probe starts reading splits
+- More fault-tolerant—filter distribution doesn't depend on coordinator availability after split scheduling
+
+**Cons**:
+- Requires changes to the exchange protocol to carry filter metadata
+- For broadcast joins, filter is replicated N times (once per worker) rather than sent once from coordinator
+- Automatic filter creation has overhead even when filters aren't useful (though TupleDomain construction is cheap)
+- Coordinator still needs separate collection path for partition pruning, so not a complete simplification
+- Bloom filters would add significant per-shuffle overhead for high-cardinality joins
+
+**Why deferred**: This approach is architecturally cleaner for worker-to-worker distribution but requires deeper changes to the exchange layer. The main RFC's coordinator-push approach reuses existing HTTP infrastructure and allows incremental rollout. Exchange-based distribution could be a future optimization once the core feature is proven.
+
 ### Alternative: Bloom Filters for High Cardinality
 
 **Approach**: Use bloom filters (DataSketches) for joins with >10K distinct values.
