@@ -10,6 +10,7 @@ This review analyzes the SPI design and abstraction boundaries in the proposed J
 
 | Area | Concern | Severity |
 |------|---------|----------|
+| **Existing SPI** | Does not reference existing index join SPI pattern | High |
 | SPI Boundary | Tight coupling to Iceberg connector | High |
 | Abstraction | `VectorIndexManager` conflates concerns | Medium |
 | API Design | Stored procedure on `system` catalog operates on external tables | High |
@@ -18,7 +19,160 @@ This review analyzes the SPI design and abstraction boundaries in the proposed J
 
 ---
 
-## 1. SPI vs Engine Boundary Analysis
+## 1. Overlap with Existing Index Join SPI
+
+Presto already has an index join SPI that the RFC does not reference. This is a significant oversight—the RFC should either extend this existing pattern or explicitly justify why a different approach is needed.
+
+### Existing Index Join SPI Components
+
+```java
+// Marker interface for index handles (opaque to engine)
+public interface ConnectorIndexHandle { }
+
+// Result of index resolution during planning
+public class ConnectorResolvedIndex {
+    ConnectorIndexHandle indexHandle;
+    TupleDomain<ColumnHandle> unresolvedTupleDomain;
+}
+
+// Connector advertises index support via metadata
+public interface ConnectorMetadata {
+    // Called during planning to find applicable indexes
+    default Optional<ConnectorResolvedIndex> resolveIndex(
+        ConnectorSession session,
+        ConnectorTableHandle tableHandle,
+        Set<ColumnHandle> indexableColumns,    // Columns to lookup by
+        Set<ColumnHandle> outputColumns,       // Columns to return
+        TupleDomain<ColumnHandle> tupleDomain  // Filter predicates
+    ) {
+        return Optional.empty();
+    }
+}
+
+// Connector provides index implementation
+public interface Connector {
+    default ConnectorIndexProvider getIndexProvider() {
+        throw new UnsupportedOperationException();
+    }
+}
+
+// Factory for obtaining index instances
+public interface ConnectorIndexProvider {
+    ConnectorIndex getIndex(
+        ConnectorTransactionHandle transactionHandle,
+        ConnectorSession session,
+        ConnectorIndexHandle indexHandle,
+        List<ColumnHandle> lookupSchema,   // Keys to lookup
+        List<ColumnHandle> outputSchema    // Columns to return
+    );
+}
+
+// The actual index implementation
+public interface ConnectorIndex {
+    // Given a RecordSet of lookup keys, return matching rows
+    ConnectorPageSource lookup(RecordSet recordSet);
+}
+```
+
+### How Existing Index Joins Work
+
+1. **Planning Phase**: Engine calls `resolveIndex()` to ask if connector has an index for the join columns
+2. **Resolution**: Connector returns `ConnectorResolvedIndex` with opaque handle + any predicates it couldn't push
+3. **Execution Phase**: Engine calls `getIndex()` to obtain `ConnectorIndex` instance
+4. **Lookup**: For each batch of probe-side keys, engine calls `index.lookup(recordSet)` to get matching rows
+
+### Comparison: Existing Index Join vs. Proposed Vector Search
+
+| Aspect | Existing Index Join | Proposed Vector Search |
+|--------|--------------------|-----------------------|
+| **Lookup semantic** | Exact match on key columns | Approximate nearest neighbors |
+| **Result cardinality** | Variable (0 to many per key) | Fixed K per query vector |
+| **Resolution** | `resolveIndex()` in planning | Not specified (VectorIndexManager?) |
+| **Handle pattern** | `ConnectorIndexHandle` (opaque) | Not specified |
+| **Execution** | `ConnectorIndex.lookup(RecordSet)` | TVF with unclear execution model |
+| **Integration** | Transparent to SQL (join optimization) | Explicit TVF call required |
+
+### Key Observation: Different Semantics, Similar Pattern
+
+Vector search has fundamentally different semantics than exact-match index lookups:
+- **Input**: Single query vector (not a batch of keys)
+- **Output**: Top-K nearest neighbors with scores
+- **Algorithm**: ANN search (not B-tree/hash lookup)
+
+However, the **SPI pattern** could be similar:
+
+```java
+// Extend the existing pattern for vector indexes
+public interface ConnectorMetadata {
+    // Existing method
+    Optional<ConnectorResolvedIndex> resolveIndex(...);
+
+    // NEW: Resolve vector index for ANN search
+    default Optional<ConnectorResolvedVectorIndex> resolveVectorIndex(
+        ConnectorSession session,
+        ConnectorTableHandle tableHandle,
+        ColumnHandle vectorColumn,
+        SimilarityFunction similarityFunction
+    ) {
+        return Optional.empty();
+    }
+}
+
+// NEW: Vector index handle (parallel to ConnectorIndexHandle)
+public interface ConnectorVectorIndexHandle { }
+
+// NEW: Resolution result (parallel to ConnectorResolvedIndex)
+public class ConnectorResolvedVectorIndex {
+    ConnectorVectorIndexHandle indexHandle;
+    VectorIndexMetadata metadata;  // dimension, similarity function, etc.
+}
+
+// NEW: Vector index provider (parallel to ConnectorIndexProvider)
+public interface ConnectorVectorIndexProvider {
+    ConnectorVectorIndex getVectorIndex(
+        ConnectorTransactionHandle transactionHandle,
+        ConnectorSession session,
+        ConnectorVectorIndexHandle indexHandle
+    );
+}
+
+// NEW: Vector index execution (parallel to ConnectorIndex)
+public interface ConnectorVectorIndex {
+    // Perform ANN search, return top-K with scores
+    VectorSearchResult search(
+        float[] queryVector,
+        int k,
+        SearchParameters params  // ef_search, etc.
+    );
+}
+```
+
+### Recommendation: Align with Existing Pattern
+
+The RFC should:
+
+1. **Reference the existing index join SPI** and explain why it doesn't fit vector search (different semantics)
+
+2. **Follow the same structural pattern**:
+   - Resolution in `ConnectorMetadata` (planning phase)
+   - Opaque handles (`ConnectorVectorIndexHandle`)
+   - Provider interface (`ConnectorVectorIndexProvider`)
+   - Execution interface (`ConnectorVectorIndex`)
+
+3. **Consider whether vector search could use index join infrastructure** for the final join-back to base table data (after getting row IDs from ANN search)
+
+4. **Address lifecycle differences**: Existing index join assumes indexes are pre-existing; vector indexes need explicit creation DDL
+
+### Why This Matters
+
+If the RFC introduces a completely parallel set of abstractions without acknowledging the existing pattern, it:
+- Creates inconsistency in Presto's SPI design
+- Misses opportunity to reuse infrastructure (split handling, caching, etc.)
+- Confuses connector developers who must learn two different patterns
+
+---
+
+## 2. SPI vs Engine Boundary Analysis
 
 ### What Should Be in the SPI (Connector Layer)
 
@@ -135,7 +289,7 @@ The engine should handle:
 
 ---
 
-## 2. Abstraction Layer Problems
+## 3. Abstraction Layer Problems
 
 ### Problem 1: Monolithic VectorIndexManager
 
@@ -251,7 +405,7 @@ This integrates with Presto's existing DDL handling and authorization framework.
 
 ---
 
-## 3. TVF Design Analysis
+## 4. TVF Design Analysis
 
 ### Current Proposal
 ```sql
@@ -299,7 +453,7 @@ The lateral join pattern (Option A) allows proper column resolution and authoriz
 
 ---
 
-## 4. Split Design
+## 5. Split Design
 
 ### Current Design (Inferred)
 
@@ -335,7 +489,7 @@ These belong in connector-specific split implementations.
 
 ---
 
-## 5. Caching Architecture
+## 6. Caching Architecture
 
 ### RFC Proposal
 - L1: Memory cache on workers
@@ -387,7 +541,7 @@ This keeps the engine in control of caching policy while connectors control load
 
 ---
 
-## 6. Specific Recommendations
+## 7. Specific Recommendations
 
 ### High Priority
 
@@ -417,7 +571,7 @@ This keeps the engine in control of caching policy while connectors control load
 
 ---
 
-## 7. Architectural Diagram (Recommended)
+## 8. Architectural Diagram (Recommended)
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -482,23 +636,25 @@ This keeps the engine in control of caching policy while connectors control load
 
 ---
 
-## 8. Open Questions for RFC Authors
+## 9. Open Questions for RFC Authors
 
-1. **Why is index metadata stored in Iceberg snapshots specifically?** This seems to preclude other connectors from supporting vector indexes.
+1. **Why not extend the existing index join SPI?** Presto already has `ConnectorIndex`, `ConnectorIndexHandle`, `ConnectorIndexProvider`, and `resolveIndex()`. The RFC should explain why this pattern doesn't work for vector search, or propose extensions to it.
 
-2. **How does authorization work?** If `system.create_vector_index` operates on arbitrary tables, what are the permission requirements?
+2. **Why is index metadata stored in Iceberg snapshots specifically?** This seems to preclude other connectors from supporting vector indexes.
 
-3. **What happens when the underlying table is modified?** Is index invalidation automatic? How does this interact with Iceberg's snapshot model?
+3. **How does authorization work?** If `system.create_vector_index` operates on arbitrary tables, what are the permission requirements?
 
-4. **How are concurrent index builds handled?** Multiple users building indexes on the same table?
+4. **What happens when the underlying table is modified?** Is index invalidation automatic? How does this interact with Iceberg's snapshot model?
 
-5. **What is the plan for supporting connectors beyond Iceberg?** The RFC should clarify if this is Iceberg-specific or a general framework.
+5. **How are concurrent index builds handled?** Multiple users building indexes on the same table?
 
-6. **How does the TVF interact with predicate pushdown?** Can WHERE clauses on the outer query be pushed through the ANN search?
+6. **What is the plan for supporting connectors beyond Iceberg?** The RFC should clarify if this is Iceberg-specific or a general framework.
+
+7. **How does the TVF interact with predicate pushdown?** Can WHERE clauses on the outer query be pushed through the ANN search?
 
 ---
 
-## 9. Conclusion
+## 10. Conclusion
 
 The RFC proposes valuable functionality, but the current design lacks proper abstraction layers. The tight coupling to Iceberg and the absence of a clear SPI will:
 
